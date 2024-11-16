@@ -1,0 +1,190 @@
+import pygame
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GL.shaders import compileProgram, compileShader
+from PIL import Image
+import numpy as np
+import math
+import time
+
+# Vertex Shader (GLSL)
+vertex_shader = """
+#version 330 core
+layout(location = 0) in vec3 aPos;
+layout(location = 1) in vec2 aTexCoords;
+out vec2 TexCoords;
+void main() {
+    gl_Position = vec4(aPos, 1.0);
+    TexCoords = aTexCoords;
+}
+"""
+
+# Fragment Shader (GLSL) for YCbCr to RGB decompression
+fragment_shader = """
+#version 330 core
+in vec2 TexCoords;
+out vec4 FragColor;
+uniform sampler2D single_channel_texture;
+
+void main() {
+    // Współrzędne próbkowania dla każdego kanału Y, Cb, Cr
+    vec2 uvY = vec2(TexCoords.x * 2.0/3.0, TexCoords.y);    
+    vec2 uvCb = vec2((TexCoords.x + 2.0)/3.0, TexCoords.y * 0.5);
+    vec2 uvCr = vec2((TexCoords.x + 2.0)/3.0, TexCoords.y * 0.5+0.5);
+
+    // Pobierz wartość każdego kanału z tekstury
+    float Y = texture(single_channel_texture, uvY).r;
+    float Cb = texture(single_channel_texture, uvCb).r - 0.5;
+    float Cr = texture(single_channel_texture, uvCr).r - 0.5;
+
+    // Konwersja YCbCr do RGB
+    float R = Y + 1.402 * Cr;
+    float G = Y - 0.344136 * Cb - 0.714136 * Cr;
+    float B = Y + 1.772 * Cb;
+
+    // kolor wyjściowy
+    FragColor = vec4(R, G, B, 1.0);
+}
+"""
+
+# Function to convert RGB to YCbCr and create a single packed texture
+def create_packed_ycbcr_texture(image_path):
+    image = Image.open(image_path).convert('RGB')
+    img_data = np.array(image) / 255.0
+    height, width, _ = img_data.shape
+
+    # Konwersja do YCbCr
+    Y = 0.299 * img_data[:, :, 0] + 0.587 * img_data[:, :, 1] + 0.114 * img_data[:, :, 2]
+    Cb = 0.5 - 0.1687 * img_data[:, :, 0] - 0.3313 * img_data[:, :, 1] + 0.5 * img_data[:, :, 2]
+    Cr = 0.5 + 0.5 * img_data[:, :, 0] - 0.4187 * img_data[:, :, 1] - 0.0813 * img_data[:, :, 2]
+
+    # Downsample Cb i Cr do 4:2:0
+    Cb_downsampled = (Cb[0::2, 0::2] + Cb[1::2, 0::2] + Cb[0::2, 1::2] + Cb[1::2, 1::2]) / 4
+    Cr_downsampled = (Cr[0::2, 0::2] + Cr[1::2, 0::2] + Cr[0::2, 1::2] + Cr[1::2, 1::2]) / 4
+
+    # Przygotowanie spakowanej tekstury
+    packed_texture = np.zeros((height, width + width//2), dtype=np.float32)
+
+    # Umieszczenie kanału Y w pełnej rozdzielczości
+    packed_texture[:, 0:width] = Y
+    packed_texture[0:height//2, width:width+width//2] = Cb_downsampled
+    packed_texture[height//2:,  width:width+width//2] = Cr_downsampled
+
+    packed_texture = (packed_texture * 255).astype(np.uint8)
+
+    # Zapis tekstury do pliku (opcjonalnie dla debugowania)
+    #packed_image = Image.fromarray((packed_texture * 255).astype(np.uint8))
+    packed_image = Image.fromarray(packed_texture)
+    packed_image.save("packed_texture_debug.png")
+
+    # Funkcja ładowania tekstury do OpenGL
+    def load_texture(data, texture_unit, width, height):
+        texture_id = glGenTextures(1)
+        glActiveTexture(GL_TEXTURE0 + texture_unit)
+        glBindTexture(GL_TEXTURE_2D, texture_id)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, data)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        return texture_id
+    
+    return load_texture(packed_texture, 0, packed_texture.shape[1], packed_texture.shape[0])
+
+# Function to create a sphere mesh
+def generate_sphere(radius, rings, sectors):
+    vertices = []
+    texcoords = []
+    indices = []
+
+    R = 1.0 / (rings - 1)
+    S = 1.0 / (sectors - 1)
+
+    for r in range(rings):
+        for s in range(sectors):
+            y = math.sin(-math.pi / 2 + math.pi * r * R)
+            x = math.cos(2 * math.pi * s * S) * math.sin(math.pi * r * R)
+            z = math.sin(2 * math.pi * s * S) * math.sin(math.pi * r * R)
+
+            vertices.append([x * radius, y * radius, z * radius])
+            texcoords.append([s * S, r * R])
+
+    for r in range(rings - 1):
+        for s in range(sectors - 1):
+            indices.extend([
+                r * sectors + s,
+                r * sectors + (s + 1),
+                (r + 1) * sectors + (s + 1),
+                r * sectors + s,
+                (r + 1) * sectors + (s + 1),
+                (r + 1) * sectors + s
+            ])
+
+    vertices = np.array(vertices, dtype=np.float32)
+    texcoords = np.array(texcoords, dtype=np.float32)
+    indices = np.array(indices, dtype=np.uint32)
+
+    return vertices, texcoords, indices
+
+def main():
+    pygame.init()
+    pygame.display.set_mode((800, 600), DOUBLEBUF | OPENGL)
+    glEnable(GL_DEPTH_TEST)
+
+    # Compile shaders
+    shader = compileProgram(
+        compileShader(vertex_shader, GL_VERTEX_SHADER),
+        compileShader(fragment_shader, GL_FRAGMENT_SHADER)
+    )
+    glUseProgram(shader)
+
+    # Load packed YCbCr texture
+    packed_texture = create_packed_ycbcr_texture('earthtexture.png')
+    glUniform1i(glGetUniformLocation(shader, "single_channel_texture"), 0)
+
+    # Generate sphere
+    vertices, texcoords, indices = generate_sphere(1.0, 50, 50)
+
+    # Initialize buffers
+    VAO = glGenVertexArrays(1)
+    VBO = glGenBuffers(1)
+    TBO = glGenBuffers(1)
+    EBO = glGenBuffers(1)
+
+    glBindVertexArray(VAO)
+
+    glBindBuffer(GL_ARRAY_BUFFER, VBO)
+    glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, None)
+    glEnableVertexAttribArray(0)
+
+    glBindBuffer(GL_ARRAY_BUFFER, TBO)
+    glBufferData(GL_ARRAY_BUFFER, texcoords.nbytes, texcoords, GL_STATIC_DRAW)
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, None)
+    glEnableVertexAttribArray(1)
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO)
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+
+    # Main loop to render
+    frame_times = []
+    total_frames = 1000
+
+    for frame_idx in range(total_frames):
+        t1 = time.perf_counter()
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glBindVertexArray(VAO)
+        glDrawElements(GL_TRIANGLES, len(indices), GL_UNSIGNED_INT, None)
+        glFinish()
+        t2 = time.perf_counter()
+
+        frame_time = (t2 - t1) * 1e6
+        frame_times.append(frame_time)
+
+    avg_render_time = sum(frame_times) / total_frames
+    print(f"Average render time per frame: {avg_render_time:.2f} microseconds")
+
+    pygame.display.flip()
+    pygame.time.wait(10000)
+    pygame.quit()
+
+if __name__ == "__main__":
+    main()
