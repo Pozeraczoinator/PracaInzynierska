@@ -48,6 +48,7 @@ def create_ycbcr_textures(image_path):
     img_data = np.array(image, dtype=np.uint8)
     height, width, _ = img_data.shape
 
+    # Inicjalizacja kanałów Y, Cb, Cr z wartością 8-bitową
     Y = np.zeros((height, width), dtype=np.uint8)
     Cb = np.zeros((height, width), dtype=np.uint8)
     Cr = np.zeros((height, width), dtype=np.uint8)
@@ -58,11 +59,6 @@ def create_ycbcr_textures(image_path):
             Y[i, j] = 0.299 * r + 0.587 * g + 0.114 * b
             Cb[i, j] = 128 + (-0.1687 * r - 0.3313 * g + 0.5 * b)
             Cr[i, j] = 128 + (0.5 * r - 0.4187 * g - 0.0813 * b)
-
-    # Clip values to ensure they are in the range [0, 255] and cast to uint8
-    Y = np.clip(Y, 0, 255).astype(np.uint8)
-    Cb = np.clip(Cb, 0, 255).astype(np.uint8)
-    Cr = np.clip(Cr, 0, 255).astype(np.uint8)
 
     #output_dir = "output_components"
     #os.makedirs(output_dir, exist_ok=True)
