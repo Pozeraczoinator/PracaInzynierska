@@ -41,14 +41,6 @@ void main() {
 }
 """
 
-# Function to compile shaders
-def create_shader_program():
-    shader = compileProgram(
-        compileShader(vertex_shader, GL_VERTEX_SHADER),
-        compileShader(fragment_shader, GL_FRAGMENT_SHADER)
-    )
-    return shader
-
 # Function to load Y, Cb, Cr textures from an image and convert to YCbCr
 def create_ycbcr_textures(image_path):
     image = Image.open(image_path).convert('RGB')
@@ -125,7 +117,10 @@ def main():
     glEnable(GL_DEPTH_TEST)
 
     # Compile and use shaders
-    shader = create_shader_program()
+    shader = compileProgram(
+        compileShader(vertex_shader, GL_VERTEX_SHADER),
+        compileShader(fragment_shader, GL_FRAGMENT_SHADER)
+    )
     glUseProgram(shader)
 
     # Load YCbCr textures
