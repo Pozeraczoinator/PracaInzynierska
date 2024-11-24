@@ -6,15 +6,17 @@ from PIL import Image
 import numpy as np
 import math
 import time
+import os
 
 # Vertex Shader (GLSL)
 vertex_shader = """
 #version 330 core
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aTexCoords;
+layout(location = 2) in vec3 offset; // Offset for instancing
 out vec2 TexCoords;
 void main() {
-    gl_Position = vec4(aPos, 1.0);
+    gl_Position = vec4(aPos + offset, 1.0);
     TexCoords = aTexCoords;
 }
 """
@@ -41,28 +43,34 @@ void main() {
 }
 """
 
-# Function to load Y, Cb, Cr textures from an image and convert to 4:1 YCbCr
 def create_ycbcr_textures(image_path):
     image = Image.open(image_path).convert('RGB')
-    img_data = np.array(image, dtype=np.uint8)
+    img_data = np.array(image) / 255.0
     height, width, _ = img_data.shape
 
-    # Y is full resolution
-    Y = np.zeros((height, width), dtype=np.uint8)
-    # Cb and Cr are at quarter resolution both horizontally and vertically
-    Cb = np.zeros((height // 4, width // 4), dtype=np.uint8)
-    Cr = np.zeros((height // 4, width // 4), dtype=np.uint8)
+    # Konwersja do YCbCr
+    Y = 0.299 * img_data[:, :, 0] + 0.587 * img_data[:, :, 1] + 0.114 * img_data[:, :, 2]
+    Cb = 0.5 - 0.1687 * img_data[:, :, 0] - 0.3313 * img_data[:, :, 1] + 0.5 * img_data[:, :, 2]
+    Cr = 0.5 + 0.5 * img_data[:, :, 0] - 0.4187 * img_data[:, :, 1] - 0.0813 * img_data[:, :, 2]
 
-    for i in range(height):
-        for j in range(width):
-            r, g, b = img_data[i, j]
-            Y[i, j] = 0.299 * r + 0.587 * g + 0.114 * b
-            if i % 4 == 0 and j % 4 == 0:
-                # Downsample every 4x4 block for Cb and Cr
-                Cb[i // 4, j // 4] = 128  + (-0.1687 * r - 0.3313 * g + 0.5 * b)
-                Cr[i // 4, j // 4] = 128  + (0.5 * r - 0.4187 * g - 0.0813 * b)
+    # Downsample Cb i Cr do 4:1:1 - średnia dla bloków 4x1
+    Cb_downsampled = (Cb[:, 0::4] + Cb[:, 1::4] + Cb[:, 2::4] + Cb[:, 3::4]) / 4
+    Cr_downsampled = (Cr[:, 0::4] + Cr[:, 1::4] + Cr[:, 2::4] + Cr[:, 3::4]) / 4
+    
 
-    # Helper to create textures
+    # Normalizacja do zakresu [0, 255]
+    Y = (Y * 255).astype(np.uint8)
+    Cb_downsampled = (Cb_downsampled * 255).astype(np.uint8)
+    Cr_downsampled = (Cr_downsampled * 255).astype(np.uint8)
+
+    # Zapis tekstur do plików (opcjonalnie dla debugowania)
+    #output_dir = "output_components"
+    #os.makedirs(output_dir, exist_ok=True)
+    #Image.fromarray(Y).save(os.path.join(output_dir, "Y_component.png"))
+    #Image.fromarray(Cb_downsampled).save(os.path.join(output_dir, "Cb_component.png"))
+    #Image.fromarray(Cr_downsampled).save(os.path.join(output_dir, "Cr_component.png"))
+
+    # Funkcja ładowania tekstury do OpenGL
     def load_texture(data, texture_unit, width, height):
         texture_id = glGenTextures(1)
         glActiveTexture(GL_TEXTURE0 + texture_unit)
@@ -72,13 +80,15 @@ def create_ycbcr_textures(image_path):
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
         return texture_id
 
+    # Ładowanie tekstur do OpenGL
     Y_texture = load_texture(Y, 0, width, height)
-    Cb_texture = load_texture(Cb, 1, width // 4, height // 4)
-    Cr_texture = load_texture(Cr, 2, width // 4, height // 4)
+    Cb_texture = load_texture(Cb_downsampled, 1, width // 4, height)
+    Cr_texture = load_texture(Cr_downsampled, 2, width // 4, height)
 
     return Y_texture, Cb_texture, Cr_texture
 
-# Function to create a sphere mesh
+
+# Sphere rendering function
 def generate_sphere(radius, rings, sectors):
     vertices = []
     texcoords = []
@@ -134,11 +144,19 @@ def main():
     # Generate sphere
     vertices, texcoords, indices = generate_sphere(1.0, 50, 50)
 
+    # Create offsets for 100 spheres
+    offsets = []
+    for i in range(10):
+        for j in range(10):
+            offsets.append([i * 2.5 - 12.5, j * 2.5 - 12.5, 0.0])  # Arrange in a grid
+    offsets = np.array(offsets, dtype=np.float32)
+
     # Initialize buffers
     VAO = glGenVertexArrays(1)
     VBO = glGenBuffers(1)
     TBO = glGenBuffers(1)
     EBO = glGenBuffers(1)
+    instanceVBO = glGenBuffers(1)
 
     glBindVertexArray(VAO)
 
@@ -155,29 +173,44 @@ def main():
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO)
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
 
-  # Glowna petla mierzenia czasu
-    frame_times = []
-    total_frames = 1000  # Liczba ramek do zmierzenia
+    # Instance offsets
+    glBindBuffer(GL_ARRAY_BUFFER, instanceVBO)
+    glBufferData(GL_ARRAY_BUFFER, offsets.nbytes, offsets, GL_STATIC_DRAW)
+    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 0, None)
+    glEnableVertexAttribArray(2)
+    glVertexAttribDivisor(2, 1)  # Make the offsets instanced
 
-    for frame_idx in range(total_frames):
-        t1 = time.perf_counter()  # Start czasu w mikrosekundach
+ # Measure rendering time for exactly 10 minutes
+    total_time = 600  # Total time in seconds (10 minutes)
+    frame_times = []  # Store individual frame times
+    start_time = time.perf_counter()  # Start time
+    elapsed_time = 0  # Initialize elapsed time
+
+    while elapsed_time < total_time:
+        t1 = time.perf_counter()  # Start frame time
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glBindVertexArray(VAO)
-        glDrawElements(GL_TRIANGLES, len(indices), GL_UNSIGNED_INT, None)
-        glFinish()  # Zatrzymanie renderowania
-        t2 = time.perf_counter()  # Koniec czasu
+        glDrawElementsInstanced(GL_TRIANGLES, len(indices), GL_UNSIGNED_INT, None, 100)  # Render 100 spheres
+        glFinish()  # Ensure rendering is complete
+        t2 = time.perf_counter()  # End frame time
 
-        frame_time = (t2 - t1) * 1e6
+        # Store the frame time
+        frame_time = t2 - t1
         frame_times.append(frame_time)
 
+        # Update elapsed time
+        elapsed_time = time.perf_counter() - start_time
+        print(f"Frame time: {frame_time:.6f} seconds, Elapsed time: {elapsed_time:.2f}/{total_time} seconds")
 
-    #Obliczenie sredniej 
-    avg_render_time = sum(frame_times) / total_frames
-    print(f"Average render time per frame: {avg_render_time:.2f} microseconds")
+    # Calculate and print statistics
+    avg_render_time = sum(frame_times) / len(frame_times)
+    total_render_time = sum(frame_times)
+    print(f"Average render time per frame: {avg_render_time:.6f} seconds")
+    print(f"Total render time across all frames: {total_render_time:.6f} seconds")
+    print(f"Total elapsed time: {elapsed_time:.6f} seconds")
 
     pygame.display.flip()
     pygame.time.wait(10000)
     pygame.quit()
-
 if __name__ == "__main__":
     main()
